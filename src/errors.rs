@@ -1,5 +1,4 @@
 use thiserror::Error;
-use win_desktop_duplication::errors::DDApiError;
 
 #[derive(Error, Debug)]
 pub enum AimAssistError {
@@ -17,7 +16,7 @@ pub enum AimAssistError {
 
     #[error("Failed to create session")]
     SessionCreationError,
-    
+
     #[error("Failed to set thread priority")]
     ThreadPriorityError(windows::core::Error),
 

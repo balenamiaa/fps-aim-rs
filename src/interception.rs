@@ -1,4 +1,4 @@
-use std::{ffi::c_ulong, fmt::Write};
+use std::ffi::c_ulong;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +40,6 @@ pub struct InterceptionKeyStroke {
 
 #[allow(non_camel_case_types)]
 pub type InterceptionStroke = [u8; std::mem::size_of::<InterceptionMouseStroke>()];
-
 
 pub const INTERCEPTION_SCANCODE_SPACE: u16 = 0x39;
 
@@ -214,7 +213,7 @@ pub const INTERCEPTION_MOUSE_TERMSRV_SRC_SHADOW: u16 = 0x100;
 // }
 
 #[link(name = "interception", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn interception_create_context() -> InterceptionContextRaw;
     pub(crate) fn interception_destroy_context(context: InterceptionContextRaw);
     pub(crate) fn interception_get_precedence(context: InterceptionContextRaw, device: InterceptionDevice) -> InterceptionPrecedence;
@@ -246,14 +245,14 @@ impl InterceptionContext {
     }
 
     fn get_mouse_device() -> i32 {
-        let mut device = 0;
+        let mut device = 1;
         loop {
             if device >= INTERCEPTION_MAX_DEVICE {
                 panic!("No mouse device found");
             }
 
             if unsafe { interception_is_mouse(device) } != 0 {
-                crate::info_text().write_str(&format!("Mouse device found: {}\n", device)).unwrap();
+                log::info!("Mouse device found: {}", device);
                 return device;
             }
             device += 1;
@@ -268,7 +267,7 @@ impl InterceptionContext {
             }
 
             if unsafe { interception_is_keyboard(device) } != 0 {
-                crate::info_text().write_str(&format!("Keyboard device found: {}\n", device)).unwrap();
+                log::info!("Keyboard device found: {}", device);
                 return device;
             }
             device += 1;
@@ -287,30 +286,7 @@ impl InterceptionContext {
 
         let result = unsafe { interception_send(self.context, self.mouse_device, &stroke as *const _ as *const InterceptionStroke, 1) };
 
-        if result == 1 {
-            Ok(())
-        } else {
-            Err(AimAssistError::MouseMovementError)
-        }
-    }
-
-    pub fn mouse_wheel_up(&self, rolling: i16) -> Result<(), AimAssistError> {
-        let stroke = InterceptionMouseStroke {
-            state: 0,
-            flags: INTERCEPTION_MOUSE_WHEEL,
-            rolling,
-            x: 0,
-            y: 0,
-            information: 0,
-        };
-
-        let result = unsafe { interception_send(self.context, self.mouse_device, &stroke as *const _ as *const InterceptionStroke, 1) };
-
-        if result == 1 {
-            Ok(())
-        } else {
-            Err(AimAssistError::MouseMovementError)
-        }
+        if result == 1 { Ok(()) } else { Err(AimAssistError::MouseMovementError) }
     }
 
     pub fn send_key(&self, key: u16, state: u16) -> Result<(), AimAssistError> {
@@ -318,11 +294,7 @@ impl InterceptionContext {
 
         let result = unsafe { interception_send(self.context, self.keyboard_device, &stroke as *const _ as *const InterceptionStroke, 1) };
 
-        if result == 1 {
-            Ok(())
-        } else {
-            Err(AimAssistError::MouseMovementError)
-        }
+        if result == 1 { Ok(()) } else { Err(AimAssistError::MouseMovementError) }
     }
 }
 
@@ -348,7 +320,7 @@ pub fn is_vk_down(vk: i32) -> bool {
 }
 
 #[link(name = "user32")]
-extern "system" {
+unsafe extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 

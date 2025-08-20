@@ -1,7 +1,7 @@
 use crate::errors::InferenceError;
 use crate::screen_capture::ScreenCaptureOutputAvailable;
-use ort::{Session, SessionInputValue, SessionInputs, SessionOutputs};
-use std::cell::{Ref, RefCell};
+use ort::session::{Session, SessionInputValue, SessionInputs, SessionOutputs};
+use std::cell::RefCell;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DetectionResult {
@@ -14,7 +14,6 @@ pub struct DetectionResult {
     pub image_width: usize,
     pub image_height: usize,
 }
-
 
 #[derive(Debug, Clone, Copy)]
 pub struct DetectionDistanceCalculator {
@@ -61,7 +60,7 @@ impl DetectionResult {
 pub struct InferenceEngine {
     session: Session,
     config: InferenceConfig,
-    detections_buffer: RefCell<Box<[Option<DetectionResult>]>>,
+    detections_buffer: Box<[Option<DetectionResult>]>,
     _intermediate_buffer: RefCell<Box<[f32]>>,
     model_fixed_num_detections: usize,
     num_classes: usize,
@@ -88,8 +87,8 @@ impl Default for InferenceConfig {
 
 impl InferenceEngine {
     const DEFAULT_MAX_DETECTIONS: usize = 100;
-    const DEFAULT_IMAGE_WIDTH: usize = 320;
-    const DEFAULT_IMAGE_HEIGHT: usize = 320;
+    const DEFAULT_IMAGE_WIDTH: usize = 640;
+    const DEFAULT_IMAGE_HEIGHT: usize = 640;
 
     pub fn new(session: Session, config: Option<InferenceConfig>) -> Result<Self, InferenceError> {
         let config = config.unwrap_or_default();
@@ -103,7 +102,7 @@ impl InferenceEngine {
         debug_assert!(inputs.len() == 1);
         debug_assert!(inputs[0].name == "images");
 
-        let output_dims = outputs[0].output_type.tensor_dimensions().unwrap().clone();
+        let output_dims = outputs[0].output_type.tensor_shape().unwrap().clone();
         let max_class_index = output_dims[1] as usize;
         let num_classes = max_class_index - 4;
         let model_fixed_num_detections = output_dims[2] as usize;
@@ -114,44 +113,38 @@ impl InferenceEngine {
         Ok(Self {
             session,
             config,
-            detections_buffer: RefCell::new(detections_buffer),
+            detections_buffer,
             _intermediate_buffer: RefCell::new(intermediate_buffer),
             model_fixed_num_detections,
             num_classes,
         })
     }
 
-    pub fn infer_screen_capture<'a>(&'a mut self, input: ScreenCaptureOutputAvailable, confidence_threshold: f32) -> Result<Ref<'a, [Option<DetectionResult>]>, InferenceError> {
-        self.detections_buffer.borrow_mut().iter_mut().for_each(|d| *d = None);
+    pub fn infer_screen_capture<'a>(&'a mut self, input: ScreenCaptureOutputAvailable, confidence_threshold: f32) -> Result<&'a mut [Option<DetectionResult>], InferenceError> {
+        self.detections_buffer.iter_mut().for_each(|d| *d = None);
 
         let mut input = unsafe { input.data_as_ort_tensor() };
         let input_tensor = input.take_tensor().unwrap();
         let session_input_value = SessionInputValue::Owned(input_tensor.into_dyn());
         let session_inputs: SessionInputs<1> = SessionInputs::ValueMap(vec![("images".into(), session_input_value)]);
         let output = self.session.run(session_inputs).map_err(InferenceError::InferenceError)?;
-        self.parse_output(output, confidence_threshold)
+        Self::parse_output(self.model_fixed_num_detections, self.config.image_width, self.config.image_height, &mut self.detections_buffer, output, confidence_threshold)
     }
 
-    fn parse_output<'a>(&'a self, output: SessionOutputs, confidence_threshold: f32) -> Result<Ref<'a, [Option<DetectionResult>]>, InferenceError> {
-        let (_, dense_tensor_as_slice) = output["output0"].try_extract_raw_tensor::<half::f16>().map_err(InferenceError::InferenceError)?;
-        let model_fixed_num_detections = self.model_fixed_num_detections;
+    fn parse_output<'a>(model_fixed_num_detections: usize, image_width: usize, image_height: usize, detections_buffer: &'a mut Box<[Option<DetectionResult>]>, output: SessionOutputs, confidence_threshold: f32) -> Result<&'a mut [Option<DetectionResult>], InferenceError> {
+        let (_, dense_tensor_as_slice) = output["output0"].try_extract_tensor::<half::f16>().map_err(InferenceError::InferenceError)?;
 
         let valid_indices: Vec<(usize, usize)> = (4 * model_fixed_num_detections..6 * model_fixed_num_detections)
             .filter_map(|index| {
                 let class_id = index / model_fixed_num_detections - 4;
                 let detection_index = index % model_fixed_num_detections;
                 let confidence: f32 = dense_tensor_as_slice[index].into();
-                if confidence > confidence_threshold {
-                    Some((detection_index, class_id))
-                } else {
-                    None
-                }
+                if confidence > confidence_threshold { Some((detection_index, class_id)) } else { None }
             })
             .collect();
 
         let mut count = 0;
         {
-            let mut detections_buffer = self.detections_buffer.borrow_mut();
             for (j, class_id) in valid_indices {
                 let x_center: f32 = dense_tensor_as_slice[0 * model_fixed_num_detections + j].into();
                 let y_center: f32 = dense_tensor_as_slice[1 * model_fixed_num_detections + j].into();
@@ -166,15 +159,14 @@ impl InferenceEngine {
                     y_min: y_center - height / 2.0,
                     x_max: x_center + width / 2.0,
                     y_max: y_center + height / 2.0,
-                    image_width: self.config.image_width,
-                    image_height: self.config.image_height,
+                    image_width,
+                    image_height,
                 });
                 count += 1;
             }
         }
 
-        let detections_buffer = self.detections_buffer.borrow();
-        Ok(Ref::map(detections_buffer, |buffer| &buffer[..count]))
+        Ok(&mut detections_buffer[..count])
     }
 
     pub fn get_best_detections(&self) -> Vec<DetectionResult> {
@@ -182,7 +174,7 @@ impl InferenceEngine {
         let mut best_scores = vec![0.0; self.num_classes];
         let mut best_results = vec![None; self.num_classes];
 
-        for detection in self.detections_buffer.borrow().iter().filter_map(|&d| d) {
+        for detection in self.detections_buffer.iter().filter_map(|&d| d) {
             let class_id = detection.class_id as usize;
             if detection.confidence > best_scores[class_id] {
                 best_scores[class_id] = detection.confidence;
